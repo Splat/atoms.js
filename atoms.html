@@ -1,0 +1,245 @@
+<div id="atomBoxWrap" style="width:100%;max-width:320px;margin:0 auto;">
+  <canvas id="atomBoxCanvas" style="width:100%;height:220px;display:block;border-radius:14px;border:1px solid rgba(0,0,0,.12);background:rgba(255,255,255,.6);backdrop-filter:blur(6px);"></canvas>
+  <div style="font:12px/1.2 system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; opacity:.7; padding:6px 2px;">
+    <a href="https://github.com/Splat/atoms.js">Atoms JS</a>
+  </div>
+</div>
+
+<script>
+(() => {
+  const canvas = document.getElementById('atomBoxCanvas');
+  if (!canvas) return;
+
+  // Respect reduced motion
+  const reduceMotion = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  const ctx = canvas.getContext('2d', { alpha: true });
+  const DPR = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+
+  function fitCanvas() {
+    const rect = canvas.getBoundingClientRect();
+    canvas.width  = Math.floor(rect.width * DPR);
+    canvas.height = Math.floor(rect.height * DPR);
+  }
+
+  fitCanvas();
+  window.addEventListener('resize', fitCanvas, { passive: true });
+
+  // Tunables
+  const N = 18;                 // number of atoms
+  const R_MIN = 7;              // atom radius min (CSS px-ish)
+  const R_MAX = 12;             // atom radius max
+  const MAX_SPEED = 1.2;        // base speed
+  const SOFTEN = 0.98;          // wall damping
+  const COLLISION_DAMP = 0.995; // collision damping
+  const ORBIT_ALPHA = 0.65;
+  const ELECTRON_ALPHA = 0.9;
+
+  // Theme-ish palette (you can tweak)
+  const palette = [
+    'rgba(120, 165, 255, 1)', // blue
+    'rgba(255, 140, 190, 1)', // pink
+    'rgba(120, 220, 190, 1)', // mint
+    'rgba(255, 200, 120, 1)', // peach
+    'rgba(170, 140, 255, 1)'  // violet
+  ];
+
+  function rand(min, max) { return min + Math.random() * (max - min); }
+  function pick(arr) { return arr[(Math.random() * arr.length) | 0]; }
+
+  const atoms = [];
+  function initAtoms() {
+    atoms.length = 0;
+    const w = canvas.width / DPR;
+    const h = canvas.height / DPR;
+
+    for (let i = 0; i < N; i++) {
+      const r = rand(R_MIN, R_MAX);
+      let x = rand(r + 4, w - r - 4);
+      let y = rand(r + 4, h - r - 4);
+
+      // Avoid spawning overlapped
+      for (let tries = 0; tries < 50; tries++) {
+        let ok = true;
+        for (const a of atoms) {
+          const dx = x - a.x, dy = y - a.y;
+          if (Math.hypot(dx, dy) < r + a.r + 2) { ok = false; break; }
+        }
+        if (ok) break;
+        x = rand(r + 4, w - r - 4);
+        y = rand(r + 4, h - r - 4);
+      }
+
+      const speed = rand(0.6, 1.0) * MAX_SPEED;
+      const ang = rand(0, Math.PI * 2);
+
+      atoms.push({
+        x, y, r,
+        vx: Math.cos(ang) * speed,
+        vy: Math.sin(ang) * speed,
+        color: pick(palette),
+        orbitPhase: rand(0, Math.PI * 2),
+        orbitSpeed: rand(0.01, 0.03),
+        orbitTilt: rand(-0.9, 0.9)
+      });
+    }
+  }
+
+  initAtoms();
+
+  function drawAtom(a, t) {
+    const x = a.x, y = a.y, r = a.r;
+
+    // nucleus
+    ctx.beginPath();
+    ctx.fillStyle = a.color;
+    ctx.globalAlpha = 0.95;
+    ctx.arc(x, y, r * 0.38, 0, Math.PI * 2);
+    ctx.fill();
+
+    // orbit ring (tilted ellipse)
+    const phase = a.orbitPhase + t * a.orbitSpeed;
+    const tilt = a.orbitTilt;
+    const rx = r * 0.95;
+    const ry = r * 0.55;
+
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.rotate(tilt);
+    ctx.beginPath();
+    ctx.globalAlpha = ORBIT_ALPHA;
+    ctx.strokeStyle = a.color;
+    ctx.lineWidth = 1;
+    // ellipse path
+    ctx.ellipse(0, 0, rx, ry, 0, 0, Math.PI * 2);
+    ctx.stroke();
+
+    // electrons (2)
+    const ex1 = Math.cos(phase) * rx;
+    const ey1 = Math.sin(phase) * ry;
+    const ex2 = Math.cos(phase + Math.PI) * rx;
+    const ey2 = Math.sin(phase + Math.PI) * ry;
+
+    ctx.globalAlpha = ELECTRON_ALPHA;
+    ctx.fillStyle = 'rgba(255,255,255,0.85)';
+    ctx.beginPath(); ctx.arc(ex1, ey1, Math.max(1.4, r * 0.12), 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(ex2, ey2, Math.max(1.4, r * 0.12), 0, Math.PI * 2); ctx.fill();
+
+    ctx.restore();
+
+    // subtle outer glow
+    ctx.beginPath();
+    ctx.globalAlpha = 0.15;
+    ctx.fillStyle = a.color;
+    ctx.arc(x, y, r * 1.15, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.globalAlpha = 1;
+  }
+
+  function resolveCollision(a, b) {
+    const dx = b.x - a.x;
+    const dy = b.y - a.y;
+    const dist = Math.hypot(dx, dy);
+    const minDist = a.r + b.r;
+
+    if (dist === 0 || dist >= minDist) return;
+
+    // Push apart (positional correction)
+    const nx = dx / dist;
+    const ny = dy / dist;
+    const overlap = minDist - dist;
+    const totalMass = a.r + b.r;
+    const aPush = (b.r / totalMass) * overlap;
+    const bPush = (a.r / totalMass) * overlap;
+
+    a.x -= nx * aPush;
+    a.y -= ny * aPush;
+    b.x += nx * bPush;
+    b.y += ny * bPush;
+
+    // Velocity swap along normal (elastic-ish)
+    const dvx = b.vx - a.vx;
+    const dvy = b.vy - a.vy;
+    const relVel = dvx * nx + dvy * ny;
+
+    // If moving apart, don't bounce
+    if (relVel > 0) return;
+
+    // Mass proportional to radius^2
+    const ma = a.r * a.r;
+    const mb = b.r * b.r;
+
+    const impulse = (-(1 + 0.98) * relVel) / (1 / ma + 1 / mb);
+
+    a.vx -= (impulse / ma) * nx;
+    a.vy -= (impulse / ma) * ny;
+    b.vx += (impulse / mb) * nx;
+    b.vy += (impulse / mb) * ny;
+
+    a.vx *= COLLISION_DAMP; a.vy *= COLLISION_DAMP;
+    b.vx *= COLLISION_DAMP; b.vy *= COLLISION_DAMP;
+  }
+
+  function step() {
+    if (reduceMotion) {
+      // Draw a single still frame
+      ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+      const w = canvas.width / DPR, h = canvas.height / DPR;
+      ctx.clearRect(0, 0, w, h);
+      ctx.globalAlpha = 1;
+      const t = performance.now();
+      for (const a of atoms) drawAtom(a, t);
+      return;
+    }
+
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    const w = canvas.width / DPR;
+    const h = canvas.height / DPR;
+
+    ctx.clearRect(0, 0, w, h);
+
+    // subtle background grid dots (optional aesthetic)
+    ctx.globalAlpha = 0.12;
+    ctx.fillStyle = 'rgba(0,0,0,0.35)';
+    for (let gy = 12; gy < h; gy += 18) {
+      for (let gx = 12; gx < w; gx += 18) {
+        ctx.fillRect(gx, gy, 1, 1);
+      }
+    }
+    ctx.globalAlpha = 1;
+
+    // Update positions
+    for (const a of atoms) {
+      a.x += a.vx;
+      a.y += a.vy;
+
+      // Wall bounce
+      if (a.x - a.r < 0) { a.x = a.r; a.vx = Math.abs(a.vx) * SOFTEN; }
+      if (a.x + a.r > w) { a.x = w - a.r; a.vx = -Math.abs(a.vx) * SOFTEN; }
+      if (a.y - a.r < 0) { a.y = a.r; a.vy = Math.abs(a.vy) * SOFTEN; }
+      if (a.y + a.r > h) { a.y = h - a.r; a.vy = -Math.abs(a.vy) * SOFTEN; }
+    }
+
+    // Collisions (O(n^2) but small n)
+    for (let i = 0; i < atoms.length; i++) {
+      for (let j = i + 1; j < atoms.length; j++) {
+        resolveCollision(atoms[i], atoms[j]);
+      }
+    }
+
+    // Draw
+    const t = performance.now();
+    for (const a of atoms) drawAtom(a, t);
+
+    requestAnimationFrame(step);
+  }
+
+  requestAnimationFrame(step);
+
+  // Optional: click to re-seed
+  canvas.addEventListener('click', () => {
+    initAtoms();
+  }, { passive: true });
+})();
+</script>
